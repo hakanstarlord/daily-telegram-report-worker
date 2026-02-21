@@ -2,6 +2,7 @@ const TZ = "Europe/Istanbul";
 const CITY = "Istanbul";
 const LAT = 41.0082;
 const LON = 28.9784;
+
 const FAVORITE_TEAMS = [
   "Galatasaray",
   "Fenerbahce",
@@ -20,6 +21,10 @@ const FAVORITE_TEAMS = [
   "Chelsea",
 ];
 
+// DEBUG bölümünü mesaja eklemek istersen true yap
+const INCLUDE_DEBUG_SOURCES = false;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function fetchJSON(url, init = {}) {
   const res = await fetch(url, init);
@@ -30,7 +35,6 @@ async function fetchJSON(url, init = {}) {
   return res.json();
 }
 
-
 async function fetchText(url, init = {}) {
   const res = await fetch(url, init);
   if (!res.ok) {
@@ -39,8 +43,6 @@ async function fetchText(url, init = {}) {
   }
   return res.text();
 }
-
-
 
 function formatDate() {
   return new Intl.DateTimeFormat("tr-TR", {
@@ -82,9 +84,25 @@ function norm(s) {
     .trim();
 }
 
+function fmtPct(x) {
+  if (x === null || x === undefined || Number.isNaN(Number(x))) return "N/A";
+  const n = Number(x);
+  const sign = n >= 0 ? "+" : "";
+  return `${sign}${n.toFixed(2)}%`;
+}
 
+async function safe(label, fn, fallback, debug) {
+  try {
+    const v = await fn();
+    debug[label] = "fresh";
+    return v;
+  } catch (e) {
+    debug[label] = `ERR: ${e?.message || String(e)}`;
+    return fallback;
+  }
+}
 
-async function getWeather() {
+async function getWeatherRaw() {
   const url =
     `https://api.open-meteo.com/v1/forecast?latitude=${LAT}&longitude=${LON}` +
     `&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max` +
@@ -98,16 +116,7 @@ async function getWeather() {
   return `🌤 ${min.toFixed(1)}°/${max.toFixed(1)}° 🌧${rain}%`;
 }
 
-function fmtPct(x) {
-  if (x === null || x === undefined || Number.isNaN(Number(x))) return "N/A";
-  const n = Number(x);
-  const sign = n >= 0 ? "+" : "";
-  return `${sign}${n.toFixed(2)}%`;
-}
-
-
-
-async function getCrypto() {
+async function getCryptoRaw() {
   const apiUrl =
     "https://api.coingecko.com/api/v3/simple/price" +
     "?ids=bitcoin,ethereum" +
@@ -122,22 +131,19 @@ async function getCrypto() {
     const eth = data.ethereum.usd;
     const btcCh = data.bitcoin.usd_24h_change;
     const ethCh = data.ethereum.usd_24h_change;
-
-    return `₿${btc} (${fmtPct(btcCh)}) Ξ${eth} (${fmtPct(ethCh)})`;
-
+    return `₿ BTC: $${btc} (${fmtPct(btcCh)}) | Ξ ETH: $${eth} (${fmtPct(ethCh)})`;
   }
 
   const res = await fetch(apiUrl, {
     headers: {
       "User-Agent": "newsdailyreport/1.0 (Cloudflare Worker)",
-      "Accept": "application/json",
+      Accept: "application/json",
     },
   });
 
   if (res.status === 429) {
-    return `₿ BTC/ETH: (CoinGecko limit aşıldı)`;
+    throw new Error("CoinGecko 429 (rate limit)");
   }
-
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(`HTTP ${res.status} for ${apiUrl} | body: ${body.slice(0, 200)}`);
@@ -163,20 +169,18 @@ async function getCrypto() {
   return `₿ BTC: $${btc} (${fmtPct(btcCh)}) | Ξ ETH: $${eth} (${fmtPct(ethCh)})`;
 }
 
-
-async function getMetals() {
-  const cacheKey = new Request("https://cache.local/stooq?metals=xau_xag_v2");
+async function getMetalsRaw(debug) {
+  const cacheKey = new Request("https://cache.local/stooq?metals=xau_xag_v3");
   const cached = await caches.default.match(cacheKey);
-  if (cached) return cached.text();
 
   async function getLastTwoCloses(symbol) {
-    // Günlük tarihsel veri (CSV): Date,Open,High,Low,Close,Volume
     const url = `https://stooq.com/q/d/l/?s=${symbol}&i=d`;
 
+    // Stooq 429 olursa exception fırlatacak, onu üstte yakalayıp cache fallback yapacağız
     const csv = await fetchText(url, {
       headers: {
         "User-Agent": "newsdailyreport/1.0 (Cloudflare Worker)",
-        "Accept": "text/csv",
+        Accept: "text/csv",
       },
     });
 
@@ -187,7 +191,6 @@ async function getMetals() {
     const closeIdx = header.indexOf("close");
     if (closeIdx === -1) throw new Error(`Close column not found for ${symbol}`);
 
-    // Son 2 satır (en alttakiler en yeni)
     const last = lines[lines.length - 1].split(",").map((v) => v.trim());
     const prev = lines[lines.length - 2].split(",").map((v) => v.trim());
 
@@ -202,28 +205,34 @@ async function getMetals() {
     return { lastClose, pct };
   }
 
-  const [xau, xag] = await Promise.all([
-    getLastTwoCloses("xauusd"),
-    getLastTwoCloses("xagusd"),
-  ]);
+  try {
+    const [xau, xag] = await Promise.all([
+      getLastTwoCloses("xauusd"),
+      getLastTwoCloses("xagusd"),
+    ]);
 
-  const text =
-  	`🥇 ${xau.lastClose.toFixed(2)} ${fmtPct(xau.pct)}  ` +
-  	`🥈 ${xag.lastClose.toFixed(2)} ${fmtPct(xag.pct)}`;
+    const text =
+      `🥇 ${xau.lastClose.toFixed(2)} ${fmtPct(xau.pct)}  ` +
+      `🥈 ${xag.lastClose.toFixed(2)} ${fmtPct(xag.pct)}`;
 
+    await caches.default.put(
+      cacheKey,
+      new Response(text, { headers: { "Cache-Control": "public, max-age=21600" } }) // 6 saat
+    );
 
-  await caches.default.put(
-    cacheKey,
-    new Response(text, { headers: { "Cache-Control": "public, max-age=600" } })
-  );
-
-  return text;
+    return text;
+  } catch (e) {
+    // Stooq patlarsa cache’den dön (varsa)
+    if (cached) {
+      debug.stooq_metals = "cache_fallback";
+      return await cached.text();
+    }
+    throw e;
+  }
 }
 
-async function getFavoriteMatches() {
+async function getFavoriteMatchesRaw() {
   const dateStr = yyyymmddInTZ();
-
-  // Takım ağırlıklı: TR + top ligler + UCL/UEL
   const leagues = [
     "tur.1",
     "eng.1",
@@ -237,7 +246,6 @@ async function getFavoriteMatches() {
   ];
 
   const favSet = new Set(FAVORITE_TEAMS.map(norm));
-
   const cacheKey = new Request(`https://cache.local/espn/favs?d=${dateStr}`);
   const cached = await caches.default.match(cacheKey);
   if (cached) return cached.text();
@@ -247,7 +255,7 @@ async function getFavoriteMatches() {
     const data = await fetchJSON(url, {
       headers: {
         "User-Agent": "newsdailyreport/1.0 (Cloudflare Worker)",
-        "Accept": "application/json",
+        Accept: "application/json",
       },
     });
     return data?.events || [];
@@ -267,13 +275,10 @@ async function getFavoriteMatches() {
     const homeName = home?.team?.displayName || "";
     const awayName = away?.team?.displayName || "";
 
-    const isFav =
-      favSet.has(norm(homeName)) ||
-      favSet.has(norm(awayName));
-
+    const isFav = favSet.has(norm(homeName)) || favSet.has(norm(awayName));
     if (!isFav) continue;
 
-    const startISO = ev?.date; // ISO
+    const startISO = ev?.date;
     const startText = startISO
       ? new Intl.DateTimeFormat("tr-TR", {
           timeZone: TZ,
@@ -282,71 +287,39 @@ async function getFavoriteMatches() {
         }).format(new Date(startISO))
       : "";
 
-    const status = ev?.status?.type?.shortDetail || ev?.status?.type?.description || "";
+    const st = ev?.status?.type;
+    const status = st?.shortDetail || st?.description || "";
+    const state = st?.state;
+    const completed = st?.completed === true;
+
     const scoreHome = home?.score;
     const scoreAway = away?.score;
 
-    // skor varsa göster, yoksa sadece saat
-    // state bilgisini al (pre / in / post)
+    const showScore = state === "in" || state === "post" || completed === true;
 
-// status objesini al
-const st = ev?.status?.type;
-const state = st?.state;
-const completed = st?.completed === true;
+    const parts = [];
+    if (startText) parts.push(startText);
+    if (showScore && scoreHome != null && scoreAway != null) parts.push(`${scoreHome}-${scoreAway}`);
+    if (status) parts.push(status);
 
-// sadece canlı veya bitmiş maçta skor göster
-const showScore =
-  state === "in" ||
-  state === "post" ||
-  completed === true;
-
-let parts = [];
-
-// saat varsa ekle
-if (startText) {
-  parts.push(startText);
-}
-
-// skor sadece gerçekten oynanıyorsa / bittiyse
-if (showScore && scoreHome != null && scoreAway != null) {
-  parts.push(`${scoreHome}-${scoreAway}`);
-}
-
-// her zaman status yaz (Scheduled, Live, FT vs.)
-if (status) {
-  parts.push(status);
-}
-
-matches.push({
-  startISO: startISO || "",
-  line:
-    `• ${homeName} vs ${awayName}` +
-    (parts.length ? ` | ${parts.join(" | ")}` : ""),
-});
-
-
-}
+    matches.push({
+      startISO: startISO || "",
+      line: `• ${homeName} vs ${awayName}` + (parts.length ? ` | ${parts.join(" | ")}` : ""),
+    });
+  }
 
   matches.sort((a, b) => (a.startISO || "").localeCompare(b.startISO || ""));
 
   const top = matches.slice(0, 6).map((m) => m.line);
-  const text =
-  	top.length
-    	? `⚽ Favoriler:\n` + top.join("\n")
-    	: `⚽ Bugün favori maç yok`;
-
-
+  const text = top.length ? `⚽ Maçlar:\n${top.join("\n")}` : `⚽ Bugün favori maç yok`;
 
   await caches.default.put(
     cacheKey,
-    new Response(text, { headers: { "Cache-Control": "public, max-age=600" } })
+    new Response(text, { headers: { "Cache-Control": "public, max-age=900" } }) // 15 dk
   );
 
   return text;
 }
-
-
-
 
 async function sendTelegram(env, text) {
   const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -358,7 +331,6 @@ async function sendTelegram(env, text) {
     disable_web_page_preview: true,
   };
 
-  // 1 kez retry: Telegram 429 dönerse "retry_after" kadar bekle
   for (let attempt = 0; attempt < 3; attempt++) {
     const res = await fetch(url, {
       method: "POST",
@@ -367,14 +339,11 @@ async function sendTelegram(env, text) {
     });
 
     const data = await res.json().catch(() => ({}));
-
     if (res.ok && data.ok !== false) return;
 
-    // 429 => bekle ve tekrar dene
     if (res.status === 429) {
-	  console.log("Telegram 429 payload:", JSON.stringify(data));
-      const retryAfter = data?.parameters?.retry_after ?? 3; // saniye
-      await new Promise((r) => setTimeout(r, (retryAfter + 1) * 1000));
+      const retryAfter = data?.parameters?.retry_after ?? 3;
+      await sleep((retryAfter + 1) * 1000);
       continue;
     }
 
@@ -384,85 +353,100 @@ async function sendTelegram(env, text) {
   throw new Error("Telegram error: 429 (retry failed)");
 }
 
-
-
-async function buildMessage() {
+async function buildMessageSafe() {
+  const debug = {};
   const date = formatDate();
 
-  const [weather, crypto, metals, matches] = await Promise.all([
-    getWeather(),
-    getCrypto(),
-    getMetals(),
-    getFavoriteMatches(),
+  const [weather, metals, crypto, matches] = await Promise.all([
+    safe("open_meteo_weather", () => getWeatherRaw(), "🌤 Hava: N/A", debug),
+    safe(
+      "stooq_metals",
+      () => getMetalsRaw(debug),
+      "🥇 N/A  🥈 N/A",
+      debug
+    ),
+    safe("coingecko_crypto", () => getCryptoRaw(), "₿ BTC/ETH: N/A", debug),
+    safe("espn_matches", () => getFavoriteMatchesRaw(), "⚽ Bugün favori maç yok", debug),
   ]);
 
-  return [
+  const lines = [
     `📌 ${date}`,
     "",
-    weather,
-    metals,
-    crypto,
+    typeof weather === "string" ? weather : "🌤 Hava: N/A",
+    typeof metals === "string" ? metals : "🥇 N/A  🥈 N/A",
+    typeof crypto === "string" ? crypto : "₿ BTC/ETH: N/A",
     "",
-    matches
-  ].join("\n");
-}
+    typeof matches === "string" ? matches : "⚽ Bugün favori maç yok",
+  ];
 
+  if (INCLUDE_DEBUG_SOURCES) {
+    lines.push(
+      "",
+      "---",
+      "DEBUG: sources",
+      ...Object.entries(debug).map(([k, v]) =>
+        v === "fresh" || v === "cache_fallback" ? `- ✅ ${k}: ${v}` : `- ❌ ${k}: ${v}`
+      )
+    );
+  }
+
+  return lines.join("\n");
+}
 
 export default {
   async scheduled(event, env, ctx) {
-    const message = await buildMessage();
-    await sendTelegram(env, message);
+    // Cron run asla "exception" ile bitmesin
+    ctx.waitUntil(
+      (async () => {
+        try {
+          const message = await buildMessageSafe();
+          await sendTelegram(env, message);
+        } catch (e) {
+          // En kötü ihtimal: Telegram'a “minimal hata” mesajı yolla (o da patlarsa log’da kalsın)
+          const fallback =
+            `📌 ${formatDate()}\n\n` +
+            `Rapor oluşturulurken hata oluştu: ${e?.message || String(e)}`;
+          try {
+            await sendTelegram(env, fallback);
+          } catch (e2) {
+            console.error("scheduled_fatal:", e2?.message || String(e2));
+          }
+        }
+      })()
+    );
   },
 
   async fetch(request, env) {
-  const url = new URL(request.url);
+    const url = new URL(request.url);
 
-  // favicon gibi isteklerde hiçbir şey yapma
-  if (url.pathname === "/favicon.ico") {
-    return new Response(null, { status: 204 });
+    if (url.pathname === "/favicon.ico") return new Response(null, { status: 204 });
+    if (url.pathname === "/") return new Response("OK. Use /run to send the report manually.", { status: 200 });
 
-  }
+    if (url.pathname === "/run") {
+      const message = await buildMessageSafe();
 
-  // Ana sayfa: yanlışlıkla tetiklemeyi engelle
-  if (url.pathname === "/") {
-    return new Response("OK. Use /run to send the report manually.", { status: 200 });
-  }
+      if (url.searchParams.get("dry") === "1") {
+        return new Response(message, {
+          status: 200,
+          headers: { "Content-Type": "text/plain; charset=utf-8" },
+        });
+      }
 
-  // Manuel tetikleme sadece /run
-  if (url.pathname === "/run") {
-  const message = await buildMessage();
+      // 60s rate limit
+      const lockKey = new Request("https://cache.local/lock/run");
+      const locked = await caches.default.match(lockKey);
+      if (locked) return new Response("Rate limited: try again in ~60s", { status: 429 });
 
-  // DRY MODE (Telegram'a göndermez)
-  if (url.searchParams.get("dry") === "1") {
-    return new Response(message, {
-      status: 200,
-      headers: { "Content-Type": "text/plain; charset=utf-8" },
-    });
-  }
+      await caches.default.put(lockKey, new Response("1", { headers: { "Cache-Control": "public, max-age=60" } }));
 
-  // 60 saniye rate limit
-  const lockKey = new Request("https://cache.local/lock/run");
-  const locked = await caches.default.match(lockKey);
-  if (locked) {
-    return new Response("Rate limited: try again in ~60s", { status: 429 });
-  }
+      try {
+        await sendTelegram(env, message);
+        return new Response("Manual run OK", { status: 200 });
+      } catch (e) {
+        return new Response(`Manual run skipped: ${e.message}`, { status: 200 });
+      }
+    }
 
-  await caches.default.put(
-    lockKey,
-    new Response("1", { headers: { "Cache-Control": "public, max-age=60" } })
-  );
-
-  try {
-    await sendTelegram(env, message);
-    return new Response("Manual run OK", { status: 200 });
-  } catch (e) {
-    return new Response(`Manual run skipped: ${e.message}`, { status: 200 });
-  }
-}
-
-
-
-  return new Response("Not found", { status: 404 });
-}
-,
+    return new Response("Not found", { status: 404 });
+  },
 };
