@@ -24,6 +24,9 @@ const FAVORITE_TEAMS = [
 // DEBUG bölümünü mesaja eklemek istersen true yap
 const INCLUDE_DEBUG_SOURCES = false;
 
+// Cron aynı gün 1 kere göndersin mi?
+const ENABLE_DAILY_DEDUPE = true;
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function fetchJSON(url, init = {}) {
@@ -141,9 +144,7 @@ async function getCryptoRaw() {
     },
   });
 
-  if (res.status === 429) {
-    throw new Error("CoinGecko 429 (rate limit)");
-  }
+  if (res.status === 429) throw new Error("CoinGecko 429 (rate limit)");
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(`HTTP ${res.status} for ${apiUrl} | body: ${body.slice(0, 200)}`);
@@ -154,10 +155,7 @@ async function getCryptoRaw() {
   await caches.default.put(
     cacheKey,
     new Response(JSON.stringify(data), {
-      headers: {
-        "Content-Type": "application/json",
-        "Cache-Control": "public, max-age=600",
-      },
+      headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=600" },
     })
   );
 
@@ -176,7 +174,6 @@ async function getMetalsRaw(debug) {
   async function getLastTwoCloses(symbol) {
     const url = `https://stooq.com/q/d/l/?s=${symbol}&i=d`;
 
-    // Stooq 429 olursa exception fırlatacak, onu üstte yakalayıp cache fallback yapacağız
     const csv = await fetchText(url, {
       headers: {
         "User-Agent": "newsdailyreport/1.0 (Cloudflare Worker)",
@@ -206,10 +203,7 @@ async function getMetalsRaw(debug) {
   }
 
   try {
-    const [xau, xag] = await Promise.all([
-      getLastTwoCloses("xauusd"),
-      getLastTwoCloses("xagusd"),
-    ]);
+    const [xau, xag] = await Promise.all([getLastTwoCloses("xauusd"), getLastTwoCloses("xagusd")]);
 
     const text =
       `🥇 ${xau.lastClose.toFixed(2)} ${fmtPct(xau.pct)}  ` +
@@ -222,7 +216,6 @@ async function getMetalsRaw(debug) {
 
     return text;
   } catch (e) {
-    // Stooq patlarsa cache’den dön (varsa)
     if (cached) {
       debug.stooq_metals = "cache_fallback";
       return await cached.text();
@@ -280,11 +273,9 @@ async function getFavoriteMatchesRaw() {
 
     const startISO = ev?.date;
     const startText = startISO
-      ? new Intl.DateTimeFormat("tr-TR", {
-          timeZone: TZ,
-          hour: "2-digit",
-          minute: "2-digit",
-        }).format(new Date(startISO))
+      ? new Intl.DateTimeFormat("tr-TR", { timeZone: TZ, hour: "2-digit", minute: "2-digit" }).format(
+          new Date(startISO)
+        )
       : "";
 
     const st = ev?.status?.type;
@@ -313,17 +304,41 @@ async function getFavoriteMatchesRaw() {
   const top = matches.slice(0, 6).map((m) => m.line);
   const text = top.length ? `⚽ Maçlar:\n${top.join("\n")}` : `⚽ Bugün favori maç yok`;
 
-  await caches.default.put(
-    cacheKey,
-    new Response(text, { headers: { "Cache-Control": "public, max-age=900" } }) // 15 dk
-  );
+  await caches.default.put(cacheKey, new Response(text, { headers: { "Cache-Control": "public, max-age=900" } }));
 
   return text;
 }
 
-async function sendTelegram(env, text) {
-  const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
+// 429 bekleme süresini olabildiğince doğru yakala:
+// - JSON: parameters.retry_after
+// - Header: Retry-After
+// - Body regex (JSON parse edilemezse)
+function extractRetryAfterSeconds({ status, headers, bodyText, json }) {
+  if (status !== 429) return null;
 
+  const j = json || {};
+  const ra1 = Number(j?.parameters?.retry_after);
+  if (Number.isFinite(ra1) && ra1 > 0) return ra1;
+
+  const h = headers?.get?.("Retry-After") || headers?.get?.("retry-after");
+  const ra2 = Number(h);
+  if (Number.isFinite(ra2) && ra2 > 0) return ra2;
+
+  const m = (bodyText || "").match(/retry_after"\s*:\s*(\d+)/i);
+  if (m) {
+    const ra3 = Number(m[1]);
+    if (Number.isFinite(ra3) && ra3 > 0) return ra3;
+  }
+
+  return 5; // en kötü varsayım
+}
+
+async function sendTelegram(env, text) {
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
+    throw new Error("Missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID");
+  }
+
+  const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
   const payload = {
     chat_id: env.TELEGRAM_CHAT_ID,
     text,
@@ -331,26 +346,52 @@ async function sendTelegram(env, text) {
     disable_web_page_preview: true,
   };
 
-  for (let attempt = 0; attempt < 3; attempt++) {
+  // Flood control’u büyütmemek için toplam beklemeyi sınırlayalım
+  let totalWaitMs = 0;
+  const MAX_TOTAL_WAIT_MS = 45_000;
+
+  for (let attempt = 0; attempt < 6; attempt++) {
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
 
-    const data = await res.json().catch(() => ({}));
+    const bodyText = await res.text().catch(() => "");
+    const data = (() => {
+      try {
+        return bodyText ? JSON.parse(bodyText) : {};
+      } catch {
+        return {};
+      }
+    })();
+
     if (res.ok && data.ok !== false) return;
 
     if (res.status === 429) {
-      const retryAfter = data?.parameters?.retry_after ?? 3;
-      await sleep((retryAfter + 1) * 1000);
+      const retryAfter = extractRetryAfterSeconds({
+        status: res.status,
+        headers: res.headers,
+        bodyText,
+        json: data,
+      });
+
+      // Telegram’ın söylediği süre + küçük tampon
+      const waitMs = (retryAfter + 1) * 1000;
+
+      totalWaitMs += waitMs;
+      if (totalWaitMs > MAX_TOTAL_WAIT_MS) {
+        throw new Error(`Telegram 429: retry_after=${retryAfter}s (giving up)`);
+      }
+
+      await sleep(waitMs);
       continue;
     }
 
-    throw new Error(`Telegram error: ${res.status} ${JSON.stringify(data)}`);
+    throw new Error(`Telegram error: ${res.status} | body: ${bodyText.slice(0, 300)}`);
   }
 
-  throw new Error("Telegram error: 429 (retry failed)");
+  throw new Error("Telegram 429 (retry failed)");
 }
 
 async function buildMessageSafe() {
@@ -359,12 +400,7 @@ async function buildMessageSafe() {
 
   const [weather, metals, crypto, matches] = await Promise.all([
     safe("open_meteo_weather", () => getWeatherRaw(), "🌤 Hava: N/A", debug),
-    safe(
-      "stooq_metals",
-      () => getMetalsRaw(debug),
-      "🥇 N/A  🥈 N/A",
-      debug
-    ),
+    safe("stooq_metals", () => getMetalsRaw(debug), "🥇 N/A  🥈 N/A", debug),
     safe("coingecko_crypto", () => getCryptoRaw(), "₿ BTC/ETH: N/A", debug),
     safe("espn_matches", () => getFavoriteMatchesRaw(), "⚽ Bugün favori maç yok", debug),
   ]);
@@ -393,24 +429,55 @@ async function buildMessageSafe() {
   return lines.join("\n");
 }
 
+// Aynı anda 2 cron instance koşarsa biri skip etsin (2 dk lock)
+async function acquireCronLock() {
+  const key = new Request("https://cache.local/lock/cron");
+  const locked = await caches.default.match(key);
+  if (locked) return false;
+
+  await caches.default.put(key, new Response("1", { headers: { "Cache-Control": "public, max-age=120" } }));
+  return true;
+}
+
+// Aynı gün 1 kere gönder (23 saat TTL yeterli)
+async function isAlreadySentToday() {
+  const today = yyyymmddInTZ();
+  const key = new Request(`https://cache.local/sent/${today}`);
+  const hit = await caches.default.match(key);
+  return Boolean(hit);
+}
+async function markSentToday() {
+  const today = yyyymmddInTZ();
+  const key = new Request(`https://cache.local/sent/${today}`);
+  await caches.default.put(key, new Response("1", { headers: { "Cache-Control": "public, max-age=82800" } }));
+}
+
 export default {
   async scheduled(event, env, ctx) {
-    // Cron run asla "exception" ile bitmesin
     ctx.waitUntil(
       (async () => {
         try {
+          const gotLock = await acquireCronLock();
+          if (!gotLock) {
+            console.log("cron: locked (another instance running) -> skip");
+            return;
+          }
+
+          if (ENABLE_DAILY_DEDUPE) {
+            const sent = await isAlreadySentToday();
+            if (sent) {
+              console.log("cron: already sent today -> skip");
+              return;
+            }
+          }
+
           const message = await buildMessageSafe();
           await sendTelegram(env, message);
+
+          if (ENABLE_DAILY_DEDUPE) await markSentToday();
         } catch (e) {
-          // En kötü ihtimal: Telegram'a “minimal hata” mesajı yolla (o da patlarsa log’da kalsın)
-          const fallback =
-            `📌 ${formatDate()}\n\n` +
-            `Rapor oluşturulurken hata oluştu: ${e?.message || String(e)}`;
-          try {
-            await sendTelegram(env, fallback);
-          } catch (e2) {
-            console.error("scheduled_fatal:", e2?.message || String(e2));
-          }
+          // Telegram 429 iken fallback mesajı atmak limiti büyütür => sadece log
+          console.error("cron error:", e?.message || String(e));
         }
       })()
     );
@@ -420,19 +487,16 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/favicon.ico") return new Response(null, { status: 204 });
-    if (url.pathname === "/") return new Response("OK. Use /run to send the report manually.", { status: 200 });
+    if (url.pathname === "/") return new Response("OK. Use /run to send manually. /run?dry=1 to preview.", { status: 200 });
 
     if (url.pathname === "/run") {
       const message = await buildMessageSafe();
 
       if (url.searchParams.get("dry") === "1") {
-        return new Response(message, {
-          status: 200,
-          headers: { "Content-Type": "text/plain; charset=utf-8" },
-        });
+        return new Response(message, { status: 200, headers: { "Content-Type": "text/plain; charset=utf-8" } });
       }
 
-      // 60s rate limit
+      // manuel spamı engelle (60s)
       const lockKey = new Request("https://cache.local/lock/run");
       const locked = await caches.default.match(lockKey);
       if (locked) return new Response("Rate limited: try again in ~60s", { status: 429 });
@@ -443,7 +507,8 @@ export default {
         await sendTelegram(env, message);
         return new Response("Manual run OK", { status: 200 });
       } catch (e) {
-        return new Response(`Manual run skipped: ${e.message}`, { status: 200 });
+        // Manual’da da fallback atma yok: 429 ise zaten fail olur
+        return new Response(`Manual run failed: ${e?.message || String(e)}`, { status: 500 });
       }
     }
 
