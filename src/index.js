@@ -452,6 +452,29 @@ async function markSentToday() {
   await caches.default.put(key, new Response("1", { headers: { "Cache-Control": "public, max-age=82800" } }));
 }
 
+// --- Pending (cron fail olursa retry) ---
+const pendingKey = () => new Request(`https://cache.local/pending/${yyyymmddInTZ()}`);
+
+async function savePendingMessage(text) {
+  // 2 gün dursun (cronlar kaçarsa da kurtarır)
+  await caches.default.put(
+    pendingKey(),
+    new Response(text, {
+      headers: { "Cache-Control": "public, max-age=172800" },
+    })
+  );
+}
+
+async function loadPendingMessage() {
+  const res = await caches.default.match(pendingKey());
+  if (!res) return null;
+  return res.text();
+}
+
+async function clearPendingMessage() {
+  await caches.default.delete(pendingKey());
+}
+
 export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
@@ -460,6 +483,16 @@ export default {
           const gotLock = await acquireCronLock();
           if (!gotLock) {
             console.log("cron: locked (another instance running) -> skip");
+            return;
+          }
+
+          // Önce pending varsa onu dene (retry cron’larda asıl iş bu)
+          const pending = await loadPendingMessage();
+          if (pending) {
+            console.log("cron: pending message found -> retry sending");
+            await sendTelegram(env, pending);
+            await clearPendingMessage();
+            if (ENABLE_DAILY_DEDUPE) await markSentToday();
             return;
           }
 
@@ -472,9 +505,15 @@ export default {
           }
 
           const message = await buildMessageSafe();
-          await sendTelegram(env, message);
 
-          if (ENABLE_DAILY_DEDUPE) await markSentToday();
+          try {
+            await sendTelegram(env, message);
+            if (ENABLE_DAILY_DEDUPE) await markSentToday();
+          } catch (e) {
+            // Gönderim fail olursa mesaj kaybolmasın: pending’e kaydet
+            await savePendingMessage(message);
+            throw e;
+          }
         } catch (e) {
           // Telegram 429 iken fallback mesajı atmak limiti büyütür => sadece log
           console.error("cron error:", e?.message || String(e));
@@ -490,8 +529,8 @@ export default {
     if (url.pathname === "/") return new Response("OK. Use /run to send manually. /run?dry=1 to preview.", { status: 200 });
 
     if (url.pathname === "/run") {
+      // dry=1: sadece preview
       const message = await buildMessageSafe();
-
       if (url.searchParams.get("dry") === "1") {
         return new Response(message, { status: 200, headers: { "Content-Type": "text/plain; charset=utf-8" } });
       }
@@ -504,10 +543,23 @@ export default {
       await caches.default.put(lockKey, new Response("1", { headers: { "Cache-Control": "public, max-age=60" } }));
 
       try {
+        // Manual’da da önce pending varsa onu kurtarmayı dene
+        const pending = await loadPendingMessage();
+        if (pending) {
+          await sendTelegram(env, pending);
+          await clearPendingMessage();
+          if (ENABLE_DAILY_DEDUPE) await markSentToday();
+          return new Response("Manual run OK (sent pending)", { status: 200 });
+        }
+
         await sendTelegram(env, message);
+        if (ENABLE_DAILY_DEDUPE) await markSentToday();
         return new Response("Manual run OK", { status: 200 });
       } catch (e) {
-        // Manual’da da fallback atma yok: 429 ise zaten fail olur
+        // Manual’da da: fail olursa pending’e kaydet (mesaj kaybolmasın)
+        try {
+          await savePendingMessage(message);
+        } catch {}
         return new Response(`Manual run failed: ${e?.message || String(e)}`, { status: 500 });
       }
     }

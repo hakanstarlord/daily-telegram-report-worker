@@ -11,9 +11,11 @@
 		"enabled": true
 	},
 	"triggers": {
-		"crons": [
-			"0 5 * * *"
-		]
+  "crons": [
+     "7 5 * * *",
+    "27 5 * * *",
+    "47 5 * * *"
+  ]
 	},
 	"compatibility_flags": [
 		"nodejs_compat"
